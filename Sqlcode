@@ -1,0 +1,117 @@
+DECLARE @FamilyID varchar(8000),
+@MailDate date,
+@WindowBegin date,
+@WindowEnd date,
+@VehicleYear varchar(8000),
+@Make varchar(8000),
+@Model varchar(8000),
+@Priority int,
+@MailFileID int,
+@HitInvoiceId int;
+ 
+Insert into LogEntries Select '-------- Car-X Hits Report --------' , GETDATE()
+ 
+Declare Mailing_Cursor Cursor For
+Select M.ID, M.FamilyID, M.MailDate, M.WindowBegin,
+M.WindowEnd, M.VehicleYear, M.Make, M.Model, P.[Priority]
+  From vMailingRecords M
+  Join Priorities P on P.VersionID = M.VersionID
+  Where HitInvoiceID is null --and MailDate > DateAdd(Week,-7, GetDate())
+  Order by MailDate, [Priority], ID
+  --989471
+ 
+Open Mailing_Cursor 
+ 
+Fetch Next From Mailing_cursor
+INTO @MailFileID, @FamilyID, @MailDate, @WindowBegin, @WindowEnd, @VehicleYear, @Make, @Model, @Priority
+ 
+While @@Fetch_Status = 0 
+Begin
+  --Insert into LogEntries Select 'Mailing Cursor Loop' , GetDate()
+ 
+  Select Top 1 @HitInvoiceid = H.ID 
+  From Invoices H
+  JOIN Invoices_HH D ON D.ORIG_ID   = H.ID
+  Left Join (Select HitInvoiceID from vMailingRecords) M1 on H.ID = M1.HitInvoiceID
+  Where H.InvoiceDate Between @WindowBegin And @WindowEnd and M1.HitInvoiceID is null  
+  and D.FAM_UNIQUE_NO  = @FamilyID
+  and H.GrossSalesAmount > 0
+  order by H.InvoiceDate, H.ID
+ 
+  If @HitInvoiceId Is Not Null
+  Begin
+ 
+  Insert Into LogEntries Select 'Hit Found MailFileID - ' + Convert(Varchar(8000), @MailFileID) + ' HitInvoiceID - '+ Convert(Varchar(8000), @HitInvoiceId), GetDate()
+ Insert into LogEntries Select 'Hit cursor loop - HitInvoiceID ' + Convert(Varchar(8000),@HitInvoiceId  )   , GETDATE()
+  Update CRXANALYSIS Set HitInvoiceID = @HitInvoiceId   Where ID = @MailFileID  
+  Set @HitInvoiceId = Null
+  End
+  Else
+  Begin
+  Insert Into LogEntries Select 'No Hits found MailFileID - ' + Convert(Varchar(8000), @MailFileID), GetDate()
+  End
+  -- Get the next Mailing_cursor. 
+  Fetch Next From Mailing_Cursor  
+  Into @MailFileID, @FamilyID, @MailDate, @WindowBegin, @WindowEnd, @VehicleYear , @Make, @Model, @Priority
+End  
+Close Mailing_Cursor; 
+Deallocate Mailing_Cursor; 
+Insert into LogEntries Select '-------- Car-X Hits Report Done --------' , GETDATE()
+ 
+ 
+ 
+ 
+ 
+Select *
+into #database From
+(
+Select Cast(MIN(TriggerDate) as date) NationalStartDate, DATEADD(Day,-11,@RunDate) NationalEndDate
+from TriggerControl where MONTH(TriggerDate) = MONTH(DATEADD(Day,-11,@RunDate)) and YEAR(TriggerDate) = Year(DATEADD(Day,-11,@RunDate))
+) A
+ 
+--Select * from #database
+ 
+--Salvage
+Select *
+Into #Salvage
+  From
+  (
+  Select Row_Number() Over (Partition By RTrim(Substring(RTrim(ToMPG.UMC), 7, 7))
+  Order By SUBSTRING(RTrim(ToMPG.UMC),14,2)) GroupOrder,
+  Dense_Rank() Over (Order By RTrim(Substring(RTrim(ToMPG.UMC), 7, 7))) GroupNumber
+  ,ToMPG.*, I.[Join Date], I.Expiry,I.Extra, I.Chk_Digit,I.Lot_Order, I.Error_Code
+  From (Select * from dbo.ufn_ToVersion_DeDup(@RunDate) where SeedFlag <> 'Y') ToMPG
+  Join Input I on I.ID = ToMPG.ID  
+  Where [Version] = 'Salvage' and SeedIndicator <> 'Y'
+  ) A
+ 
+Truncate Table Salvage_Raw
+ 
+Insert Into Salvage_Raw
+Select * from #Salvage
+ 
+  Update [Salvage_Raw]
+  Set Address3 = ''
+  where Address4 like '%' + Address3 + '%' and Address3 <> ''
+ 
+  Update [Salvage_Raw]
+  Set Address4 = Address4 + ' ' + address3, Address3 = ''
+  where address3 like 'APT%'
+ 
+--Address Dedup on Version and Address
+Select *
+Into #HH_Version_DeDup
+  From
+  (
+  Select Dense_Rank() Over (Order By Case when TriggerID = 24 then 'IPERP_Survey1' When TriggerID = 31 then 'IPERP_Survey2' Else Version End, Address4, Zip) GroupNumber,
+  Row_Number() Over (Partition By Case when TriggerID = 24 then 'IPERP1' When TriggerID = 31 then 'IPERP2' Else Version End, Address4, Zip Order By [Priority], ISNULL(Email,'') desc) GroupOrder, *
+  From(
+  Select *
+  From ufn_ToVersion_DeDup(@RunDate) ToMPG
+  Where [Version] not in ( 'Salvage','NACCR','ERS_Upgrade','CCP_RETINSP','TRAV_REWARDS')  and SeedFlag <> 'Y') Z
+  ) A
+  where groupOrder = 1
+Union All
+Select *
+  From
+  (
